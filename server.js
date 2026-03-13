@@ -31,7 +31,7 @@ const OWNER_ID = process.env.OWNER_ID || "8257970991";
 const PESAPAL_CONSUMER_KEY = process.env.PESAPAL_CONSUMER_KEY;
 const PESAPAL_CONSUMER_SECRET = process.env.PESAPAL_CONSUMER_SECRET;
 const PESAPAL_ENV = process.env.PESAPAL_ENV || "live";
-const PESAPAL_IPN_ID = process.env.PESAPAL_IPN_ID || "74bc498e-3cd1-4f01-94d4-daa0aa2f64b8"; // Your registered IPN ID
+const PESAPAL_IPN_ID = process.env.PESAPAL_IPN_ID;
 const MAX_AMOUNT = 150000;
 const BATCH_SIZE = 5;
 
@@ -59,21 +59,24 @@ const db = new sqlite3.Database("./donations.db", (err) => {
   logger.info("Connected to SQLite database");
 });
 
+// Drop and recreate table with correct schema
 db.serialize(() => {
+  // Drop existing table if it has wrong schema
+  db.run(`DROP TABLE IF EXISTS donations`);
+  
+  // Create table with correct schema
   db.run(`
-    CREATE TABLE IF NOT EXISTS donations (
+    CREATE TABLE donations (
       id TEXT PRIMARY KEY,
       phone TEXT NOT NULL,
       amount INTEGER NOT NULL,
       status TEXT DEFAULT 'PENDING',
-      pesapal_transaction_id TEXT,
-      pesapal_reference TEXT,
-      pesapal_tracking_id TEXT,
-      error_message TEXT,
-      retry_count INTEGER DEFAULT 0,
-      ipn_id TEXT,
+      order_tracking_id TEXT,
+      merchant_reference TEXT,
       redirect_url TEXT,
       payment_link TEXT,
+      error_message TEXT,
+      retry_count INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
@@ -83,7 +86,7 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_status ON donations(status)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_created_at ON donations(created_at)`);
   
-  logger.info("Database schema initialized");
+  logger.info("Database schema initialized with correct columns");
 });
 
 // ---- EXPRESS ----
@@ -92,7 +95,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ---- TELEGRAM BOT ----
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 const webhookUrl = `${TELEGRAM_WEBHOOK_URL}/bot${TELEGRAM_BOT_TOKEN}`;
 
 // Set webhook on startup
@@ -136,6 +139,12 @@ const formatPhoneForPesapal = (phone) => {
   return cleaned;
 };
 
+// Escape markdown characters for Telegram
+const escapeMarkdown = (text) => {
+  if (!text) return '';
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+};
+
 // ========== PESAPAL API 3.0 FUNCTIONS ==========
 
 /**
@@ -167,10 +176,6 @@ async function getPesapalToken() {
     }
   } catch (err) {
     logger.error("Failed to get token:", err.response?.data || err.message);
-    if (err.response) {
-      logger.error("Status:", err.response.status);
-      logger.error("Data:", err.response.data);
-    }
     return null;
   }
 }
@@ -217,7 +222,7 @@ async function submitOrder(phone, amount, donationId, token) {
 
     logger.info("Order submission response:", response.data);
     
-    if (response.data) {
+    if (response.data && response.data.redirect_url) {
       const result = {
         success: true,
         redirect_url: response.data.redirect_url,
@@ -232,35 +237,7 @@ async function submitOrder(phone, amount, donationId, token) {
     return { success: false, error: "Invalid response from Pesapal" };
   } catch (err) {
     logger.error("Order submission failed:", err.response?.data || err.message);
-    if (err.response) {
-      logger.error("Error details:", JSON.stringify(err.response.data, null, 2));
-    }
     throw err;
-  }
-}
-
-/**
- * Get transaction status
- */
-async function getTransactionStatus(trackingId, merchantReference, token) {
-  try {
-    const url = `${BASE_URL}/Transactions/GetTransactionStatus`;
-    
-    const response = await http.get(url, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      },
-      params: {
-        order_tracking_id: trackingId,
-        order_merchant_reference: merchantReference
-      }
-    });
-
-    return response.data;
-  } catch (err) {
-    logger.error("Failed to get transaction status:", err.message);
-    return null;
   }
 }
 
@@ -283,9 +260,8 @@ async function processDonation(phone, amount, donationId) {
       await new Promise((resolve, reject) => {
         db.run(
           `UPDATE donations SET 
-             pesapal_transaction_id = ?,
-             pesapal_reference = ?,
-             pesapal_tracking_id = ?,
+             order_tracking_id = ?,
+             merchant_reference = ?,
              redirect_url = ?,
              payment_link = ?,
              status = ?,
@@ -294,10 +270,9 @@ async function processDonation(phone, amount, donationId) {
           [
             result.order_tracking_id,
             result.merchant_reference,
-            result.order_tracking_id,
             result.redirect_url,
             result.redirect_url,
-            "PENDING", // Changed from PROCESSING to PENDING
+            "PENDING",
             donationId
           ],
           (err) => err ? reject(err) : resolve()
@@ -343,8 +318,8 @@ bot.on("message", async (msg) => {
 
   try {
     if (text === "/start" || text === "/help") {
-      const helpMessage = `
-🤖 *Support Street Kids Donation Bot*
+      const helpMessage = 
+`🤖 *Support Street Kids Donation Bot*
 
 *Commands:*
 • Send phone (2547XXXXXXXX) - Generate payment link for KES 100
@@ -357,12 +332,12 @@ bot.on("message", async (msg) => {
 • /test-auth - Test Pesapal authentication
 
 *Examples:*
-\`/bulk 5\` - Process 5 donations at a time
-\`/status DON_123456\` - Check donation status
-\`/link DON_123456\` - Get payment link
+/bulk 5 - Process 5 donations at a time
+/status DON_123456 - Check donation status
+/link DON_123456 - Get payment link
 
-*CSV Format:* phone,amount
-      `;
+*CSV Format:* phone,amount`;
+      
       return bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
     }
 
@@ -381,14 +356,13 @@ bot.on("message", async (msg) => {
           return bot.sendMessage(chatId, "❌ Failed to fetch statistics");
         }
         
-        const stats = `
-📊 *Donation Statistics*
+        const stats = 
+`📊 *Donation Statistics*
 Total: ${row.total || 0}
 ✅ Completed: ${row.completed || 0}
 ⏳ Pending: ${row.pending || 0}
 ❌ Failed: ${row.failed || 0}
-💰 Total Amount: KES ${row.total_amount || 0}
-        `;
+💰 Total Amount: KES ${row.total_amount || 0}`;
         
         bot.sendMessage(chatId, stats, { parse_mode: 'Markdown' });
       });
@@ -397,17 +371,17 @@ Total: ${row.total || 0}
 
     if (text === "/health") {
       const health = await checkHealth();
-      const status = health.database && health.pesapal ? "✅" : "⚠️";
-      bot.sendMessage(chatId, 
-        `${status} *System Health*\n` +
-        `• Database: ${health.database ? '✅' : '❌'}\n` +
-        `• Pesapal: ${health.pesapal ? '✅' : '❌'}\n` +
-        `• Environment: ${PESAPAL_ENV}\n` +
-        `• API URL: ${BASE_URL}\n` +
-        `• IPN ID: ${PESAPAL_IPN_ID}\n` +
-        `• Uptime: ${Math.floor(health.uptime / 60)} minutes`,
-        { parse_mode: 'Markdown' }
-      );
+      const statusIcon = health.database && health.pesapal ? "✅" : "⚠️";
+      const message = 
+`${statusIcon} *System Health*
+• Database: ${health.database ? '✅' : '❌'}
+• Pesapal: ${health.pesapal ? '✅' : '❌'}
+• Environment: ${PESAPAL_ENV}
+• API URL: ${BASE_URL}
+• IPN ID: ${PESAPAL_IPN_ID || 'Not set'}
+• Uptime: ${Math.floor(health.uptime / 60)} minutes`;
+      
+      bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
       return;
     }
 
@@ -418,17 +392,11 @@ Total: ${row.total || 0}
       
       if (token) {
         bot.sendMessage(chatId, 
-          `✅ *Authentication Successful*\n\n` +
-          `Token: ${token.substring(0, 30)}...\n` +
-          `Environment: ${PESAPAL_ENV}`,
+          `✅ *Authentication Successful*\n\nToken: ${token.substring(0, 30)}...\nEnvironment: ${PESAPAL_ENV}`,
           { parse_mode: 'Markdown' }
         );
       } else {
-        bot.sendMessage(chatId, 
-          `❌ *Authentication Failed*\n\n` +
-          `Check your credentials.`,
-          { parse_mode: 'Markdown' }
-        );
+        bot.sendMessage(chatId, "❌ *Authentication Failed*\n\nCheck your credentials.", { parse_mode: 'Markdown' });
       }
       return;
     }
@@ -446,24 +414,17 @@ Total: ${row.total || 0}
           return bot.sendMessage(chatId, "❌ Donation not found");
         }
         
-        let statusMessage = `
-📋 *Donation Details*
+        const message = 
+`📋 *Donation Details*
 ID: ${row.id}
 Phone: ${row.phone}
 Amount: KES ${row.amount}
 Status: ${row.status}
 Created: ${new Date(row.created_at).toLocaleString()}
-        `;
+${row.order_tracking_id ? `\nTracking ID: ${row.order_tracking_id}` : ''}
+${row.error_message ? `\n❌ Error: ${row.error_message}` : ''}`;
         
-        if (row.pesapal_transaction_id) {
-          statusMessage += `\nTransaction ID: ${row.pesapal_transaction_id}`;
-        }
-        
-        if (row.error_message) {
-          statusMessage += `\n\n❌ Error: ${row.error_message}`;
-        }
-        
-        bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
       });
       return;
     }
@@ -482,12 +443,14 @@ Created: ${new Date(row.created_at).toLocaleString()}
         }
         
         if (row.payment_link) {
-          bot.sendMessage(chatId, 
-            `🔗 *Payment Link for ${donationId}*\n\n` +
-            `${row.payment_link}\n\n` +
-            `Share this link with the donor to complete payment.`,
-            { parse_mode: 'Markdown' }
-          );
+          const message = 
+`🔗 *Payment Link for ${donationId}*
+
+${row.payment_link}
+
+Share this link with the donor to complete payment.`;
+          
+          bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
         } else {
           bot.sendMessage(chatId, "❌ No payment link available for this donation");
         }
@@ -517,13 +480,16 @@ Created: ${new Date(row.created_at).toLocaleString()}
         const result = await processDonation(row.phone, row.amount, donationId);
         
         if (result.success) {
-          bot.sendMessage(chatId, 
-            `✅ *Payment Link Generated*\n\n` +
-            `Donation: ${donationId}\n` +
-            `Tracking ID: ${result.tracking_id}\n\n` +
-            `🔗 *Payment Link:*\n${result.payment_link}`,
-            { parse_mode: 'Markdown' }
-          );
+          const message = 
+`✅ *Payment Link Generated*
+
+Donation: ${donationId}
+Tracking ID: ${result.tracking_id}
+
+🔗 *Payment Link:*
+${result.payment_link}`;
+          
+          bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
         } else {
           bot.sendMessage(chatId, `❌ Failed: ${result.error}`);
         }
@@ -606,9 +572,7 @@ Created: ${new Date(row.created_at).toLocaleString()}
             }
 
             await bot.editMessageText(
-              `📊 Progress: ${Math.min(i + customBatchSize, results.length)}/${results.length}\n` +
-              `✅ Success: ${successCount}\n` +
-              `❌ Failed: ${failCount}`,
+              `📊 Progress: ${Math.min(i + customBatchSize, results.length)}/${results.length}\n✅ Success: ${successCount}\n❌ Failed: ${failCount}`,
               {
                 chat_id: chatId,
                 message_id: statusMsg.message_id
@@ -616,29 +580,31 @@ Created: ${new Date(row.created_at).toLocaleString()}
             );
           }
 
-          // Send all payment links
+          // Send summary
+          const summaryMessage = 
+`✅ *Bulk Processing Complete*
+
+Total: ${results.length}
+✅ Successful: ${successCount}
+❌ Failed: ${failCount}
+⚠️ Invalid: ${invalidRows.length}`;
+          
+          bot.sendMessage(chatId, summaryMessage, { parse_mode: 'Markdown' });
+          
+          // Send links in batches
           if (links.length > 0) {
             let linkMessage = "🔗 *Payment Links Generated*\n\n";
             links.forEach(item => {
               linkMessage += `📱 ${item.phone}\nID: ${item.id}\nLink: ${item.link}\n\n`;
             });
             
-            // Split if too long
-            if (linkMessage.length > 4000) {
+            // Split if too long (Telegram limit is 4096)
+            if (linkMessage.length > 3500) {
               bot.sendMessage(chatId, `✅ Generated ${links.length} payment links. Use /link [id] to get individual links.`);
             } else {
               bot.sendMessage(chatId, linkMessage, { parse_mode: 'Markdown' });
             }
           }
-
-          bot.sendMessage(chatId, 
-            `✅ *Bulk Processing Complete*\n\n` +
-            `Total: ${results.length}\n` +
-            `✅ Success: ${successCount}\n` +
-            `❌ Failed: ${failCount}\n` +
-            `⚠️ Invalid: ${invalidRows.length}`,
-            { parse_mode: 'Markdown' }
-          );
         });
       
       return;
@@ -668,41 +634,50 @@ Created: ${new Date(row.created_at).toLocaleString()}
           const result = await processDonation(text, amount, donationId);
           
           if (result.success) {
-            // Send the payment link to the donor
+            // Try to send DM to donor
             try {
-              await bot.sendMessage(text, 
-                `🤝 *Support Street Kids*\n\n` +
-                `Thank you for your willingness to donate KES ${amount}!\n\n` +
-                `🔗 Click this link to complete your payment:\n${result.payment_link}\n\n` +
-                `The link will expire in 30 minutes.`,
-                { parse_mode: 'Markdown' }
-              );
+              const donorMessage = 
+`🤝 *Support Street Kids*
+
+Thank you for your willingness to donate KES ${amount}!
+
+🔗 Click this link to complete your payment:
+${result.payment_link}
+
+The link will expire in 30 minutes.`;
               
-              bot.sendMessage(chatId, 
-                `✅ *Payment Link Sent*\n\n` +
-                `📱 Phone: ${text}\n` +
-                `💰 Amount: KES ${amount}\n` +
-                `🆔 Donation ID: ${donationId}\n\n` +
-                `The payment link has been sent to the donor via Telegram.`,
-                { parse_mode: 'Markdown' }
-              );
+              await bot.sendMessage(text, donorMessage, { parse_mode: 'Markdown' });
+              
+              const ownerMessage = 
+`✅ *Payment Link Sent*
+
+📱 Phone: ${text}
+💰 Amount: KES ${amount}
+🆔 Donation ID: ${donationId}
+
+The payment link has been sent to the donor via Telegram.`;
+              
+              bot.sendMessage(chatId, ownerMessage, { parse_mode: 'Markdown' });
+              
             } catch (dmError) {
               // If can't send DM, send link to owner
-              bot.sendMessage(chatId, 
-                `✅ *Payment Link Generated*\n\n` +
-                `📱 Phone: ${text}\n` +
-                `💰 Amount: KES ${amount}\n` +
-                `🆔 Donation ID: ${donationId}\n\n` +
-                `🔗 *Payment Link:*\n${result.payment_link}\n\n` +
-                `Please share this link with the donor.`,
-                { parse_mode: 'Markdown' }
-              );
+              const ownerMessage = 
+`✅ *Payment Link Generated*
+
+📱 Phone: ${text}
+💰 Amount: KES ${amount}
+🆔 Donation ID: ${donationId}
+
+🔗 *Payment Link:*
+${result.payment_link}
+
+Please share this link with the donor.`;
+              
+              bot.sendMessage(chatId, ownerMessage, { parse_mode: 'Markdown' });
             }
           } else {
             bot.sendMessage(chatId, 
-              `❌ *Payment Initiation Failed*\n\n` +
-              `Error: ${result.error}\n` +
-              `Retry with: /retry ${donationId}`,
+              `❌ *Payment Initiation Failed*\n\nError: ${result.error}\nRetry with: /retry ${donationId}`,
               { parse_mode: 'Markdown' }
             );
           }
@@ -876,7 +851,7 @@ app.post(`/bot${TELEGRAM_BOT_TOKEN}`, (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     name: "Support Street Kids Donation Bot",
-    version: "3.1.0",
+    version: "3.2.0",
     status: "running",
     environment: PESAPAL_ENV,
     api_url: BASE_URL,
