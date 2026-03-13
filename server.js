@@ -4,7 +4,6 @@ const TelegramBot = require("node-telegram-bot-api");
 const sqlite3 = require("sqlite3").verbose();
 const fs = require("fs");
 const csv = require("csv-parser");
-const fetch = require("node-fetch");
 const rateLimit = require("axios-rate-limit");
 const axios = require("axios");
 const crypto = require("crypto");
@@ -31,12 +30,10 @@ const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL;
 const OWNER_ID = process.env.OWNER_ID || "8257970991";
 const PESAPAL_CONSUMER_KEY = process.env.PESAPAL_CONSUMER_KEY;
 const PESAPAL_CONSUMER_SECRET = process.env.PESAPAL_CONSUMER_SECRET;
-const PESAPAL_ENV = process.env.PESAPAL_ENV || "demo"; // 'demo' or 'live'
-const PESAPAL_BASE_URL = PESAPAL_ENV === 'live' 
-  ? "https://pay.pesapal.com/v3" 
-  : "https://demo.pesapal.com/v3";
-const MAX_AMOUNT = 150000; // Maximum donation amount in KES
-const BATCH_SIZE = 5; // Process 5 donations at a time
+const PESAPAL_ENV = process.env.PESAPAL_ENV || "live";
+const PESAPAL_BASE_URL = process.env.PESAPAL_API_BASE || "https://www.pesapal.com/API";
+const MAX_AMOUNT = 150000;
+const BATCH_SIZE = 5;
 
 // ---- LOGGER ----
 const logger = {
@@ -77,6 +74,27 @@ db.serialize(() => {
   logger.info("Database schema initialized");
 });
 
+// ---- EXPRESS ----
+const app = express();
+app.use(express.json());
+
+// ---- TELEGRAM BOT ----
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+const webhookUrl = `${TELEGRAM_WEBHOOK_URL}/bot${TELEGRAM_BOT_TOKEN}`;
+
+// Set webhook on startup
+bot.setWebHook(webhookUrl).then(() => {
+  logger.info(`Webhook set to: ${webhookUrl}`);
+}).catch(err => {
+  logger.error("Failed to set webhook:", err);
+});
+
+// ---- RATE LIMITER FOR PESAPAL ----
+const http = rateLimit(axios.create(), { 
+  maxRequests: 1, 
+  perMilliseconds: 1500
+});
+
 // ---- HELPER FUNCTIONS ----
 const validatePhone = (phone) => {
   const phoneRegex = /^254[0-9]{9}$/;
@@ -94,47 +112,26 @@ const generateDonationId = () => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ---- EXPRESS ----
-const app = express();
-app.use(express.json());
-
-// ---- TELEGRAM BOT ----
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
-bot.setWebHook(`${TELEGRAM_WEBHOOK_URL}/bot${TELEGRAM_BOT_TOKEN}`);
-
-// ---- RATE LIMITER FOR PESAPAL ----
-const http = rateLimit(axios.create(), { 
-  maxRequests: 1, 
-  perMilliseconds: 1500 // 1.5 seconds between requests
-});
-
 // ---- PESAPAL FUNCTIONS ----
 async function getPesapalToken() {
   try {
-    const url = `${PESAPAL_BASE_URL}/api/token`;
-    const auth = Buffer.from(`${PESAPAL_CONSUMER_KEY}:${PESAPAL_CONSUMER_SECRET}`).toString("base64");
+    const url = `${PESAPAL_BASE_URL}/Auth/RequestToken`;
     
-    const response = await fetch(url, {
-      method: "POST",
+    // Using axios instead of fetch
+    const response = await http.post(url, {
+      consumer_key: PESAPAL_CONSUMER_KEY,
+      consumer_secret: PESAPAL_CONSUMER_SECRET
+    }, {
       headers: {
-        'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
-      },
-      body: JSON.stringify({
-        grant_type: 'client_credentials'
-      })
+      }
     });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
     logger.info("Successfully obtained Pesapal token");
-    return data.access_token;
+    return response.data.token || response.data.access_token;
   } catch (err) {
-    logger.error("Failed to get Pesapal token:", err.message);
+    logger.error("Failed to get Pesapal token:", err.response?.data || err.message);
     return null;
   }
 }
@@ -144,37 +141,40 @@ async function sendSTK(phone, amount, donationId, retryCount = 0) {
     const token = await getPesapalToken();
     if (!token) throw new Error("No Pesapal token available");
 
+    // Format phone number (remove any non-numeric characters)
+    const cleanPhone = phone.replace(/\D/g, '');
+    
     const payload = {
       amount: amount,
-      phone_number: phone,
+      phone: cleanPhone,
       reference: donationId,
       description: "Support Street Kids Donation",
-      callback_url: `${TELEGRAM_WEBHOOK_URL}/callback`,
+      callback_url: process.env.PESAPAL_CALLBACK_URL || `${TELEGRAM_WEBHOOK_URL}/callback`,
       currency: "KES"
     };
 
-    logger.info(`Sending STK push for donation ${donationId}:`, payload);
+    logger.info(`Sending STK push for donation ${donationId}`);
 
     const response = await http.post(
-      `${PESAPAL_BASE_URL}/api/stkpush`,
+      `${PESAPAL_BASE_URL}/SubmitOrderDirect`,
       payload,
       { 
         headers: { 
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000 // 30 second timeout
+        timeout: 30000
       }
     );
 
-    logger.info(`STK push successful for ${donationId}:`, response.data);
+    logger.info(`STK push successful for ${donationId}`);
     
-    // Update database with Pesapal reference
-    if (response.data.transaction_id) {
+    if (response.data.transaction_id || response.data.OrderTrackingId) {
+      const transactionId = response.data.transaction_id || response.data.OrderTrackingId;
       await new Promise((resolve, reject) => {
         db.run(
           `UPDATE donations SET pesapal_transaction_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          [response.data.transaction_id, donationId],
+          [transactionId, donationId],
           (err) => err ? reject(err) : resolve()
         );
       });
@@ -182,9 +182,8 @@ async function sendSTK(phone, amount, donationId, retryCount = 0) {
     
     return { success: true, data: response.data };
   } catch (err) {
-    logger.error(`STK push failed for ${donationId} (attempt ${retryCount + 1}):`, err.message);
+    logger.error(`STK push failed for ${donationId} (attempt ${retryCount + 1}):`, err.response?.data || err.message);
     
-    // Update error message in database
     await new Promise((resolve) => {
       db.run(
         `UPDATE donations SET error_message = ?, retry_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -206,7 +205,7 @@ async function sendSTKWithRetry(phone, amount, donationId, maxRetries = 3) {
       }
       
       if (i < maxRetries - 1) {
-        const waitTime = 2000 * (i + 1); // Exponential backoff
+        const waitTime = 2000 * (i + 1);
         logger.info(`Retrying ${donationId} in ${waitTime}ms (attempt ${i + 2}/${maxRetries})`);
         await sleep(waitTime);
       }
@@ -224,14 +223,12 @@ bot.on("message", async (msg) => {
   const userId = msg.from.id.toString();
   const text = msg.text;
 
-  // Verify owner
   if (userId !== OWNER_ID) {
     logger.warn(`Unauthorized access attempt from user ${userId}`);
     return bot.sendMessage(chatId, "⛔ Unauthorized. This bot is private.");
   }
 
   try {
-    // Help command
     if (text === "/start" || text === "/help") {
       const helpMessage = `
 🤖 *Support Street Kids Donation Bot*
@@ -252,7 +249,6 @@ bot.on("message", async (msg) => {
       return bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
     }
 
-    // Stats command
     if (text === "/stats") {
       db.get(`
         SELECT 
@@ -282,7 +278,6 @@ Total: ${row.total || 0}
       return;
     }
 
-    // Health command
     if (text === "/health") {
       const health = await checkHealth();
       const status = health.database && health.pesapal ? "✅" : "⚠️";
@@ -291,14 +286,12 @@ Total: ${row.total || 0}
         `• Database: ${health.database ? '✅' : '❌'}\n` +
         `• Pesapal: ${health.pesapal ? '✅' : '❌'}\n` +
         `• Uptime: ${Math.floor(health.uptime / 60)} minutes\n` +
-        `• Memory: ${health.memory}\n` +
-        `• Batch Size: ${BATCH_SIZE}`,
+        `• Memory: ${health.memory}`,
         { parse_mode: 'Markdown' }
       );
       return;
     }
 
-    // Retry command
     if (text.startsWith("/retry")) {
       const args = text.split(' ');
       if (args.length < 2) {
@@ -329,7 +322,6 @@ Total: ${row.total || 0}
       return;
     }
 
-    // Bulk CSV processing
     if (text.startsWith("/bulk")) {
       const args = text.split(' ');
       const customBatchSize = args[1] ? parseInt(args[1]) : BATCH_SIZE;
@@ -338,7 +330,6 @@ Total: ${row.total || 0}
         return bot.sendMessage(chatId, "❌ donors.csv file not found. Please upload the file first.");
       }
 
-      // Read and validate CSV
       const results = [];
       let invalidRows = [];
 
@@ -370,14 +361,12 @@ Total: ${row.total || 0}
           let successCount = 0;
           let failCount = 0;
 
-          // Process in batches
           for (let i = 0; i < results.length; i += customBatchSize) {
             const batch = results.slice(i, i + customBatchSize);
             const batchPromises = batch.map(async (row) => {
               try {
                 const donationId = generateDonationId();
                 
-                // Insert into database
                 await new Promise((resolve, reject) => {
                   db.run(
                     `INSERT INTO donations (id, phone, amount, status) VALUES (?, ?, ?, ?)`,
@@ -386,14 +375,12 @@ Total: ${row.total || 0}
                   );
                 });
                 
-                // Send STK push
                 const result = await sendSTKWithRetry(row.phone, row.amount, donationId);
                 
                 if (result.success) {
                   successCount++;
                   return { success: true, donationId };
                 } else {
-                  // Update status to FAILED
                   await new Promise((resolve) => {
                     db.run(
                       `UPDATE donations SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -411,9 +398,8 @@ Total: ${row.total || 0}
               }
             });
 
-            const batchResults = await Promise.all(batchPromises);
+            await Promise.all(batchPromises);
             
-            // Update progress
             await bot.editMessageText(
               `📊 Processing ${results.length} donations in batches of ${customBatchSize}\n` +
               `⚠️ Invalid rows: ${invalidRows.length}\n\n` +
@@ -426,13 +412,11 @@ Total: ${row.total || 0}
               }
             );
 
-            // Small delay between batches
             if (i + customBatchSize < results.length) {
               await sleep(2000);
             }
           }
 
-          // Final summary
           const summary = `
 ✅ *Bulk Processing Complete!*
 
@@ -451,14 +435,13 @@ ${invalidRows.length > 0 ? '\n*Invalid Rows:*\n' + invalidRows.map(r => `• ${J
       return;
     }
 
-    // Single donation (phone number)
     if (text && text.startsWith("254") && text.length === 12) {
       if (!validatePhone(text)) {
         return bot.sendMessage(chatId, "❌ Invalid phone format. Use: 2547XXXXXXXX");
       }
 
       const donationId = generateDonationId();
-      const amount = 100; // Default amount
+      const amount = 100;
 
       bot.sendMessage(chatId, `🔄 Processing donation for ${text}...`);
 
@@ -480,7 +463,7 @@ ${invalidRows.length > 0 ? '\n*Invalid Rows:*\n' + invalidRows.map(r => `• ${J
               `✅ STK push sent successfully!\n` +
               `📱 Phone: ${text}\n` +
               `💰 Amount: KES ${amount}\n` +
-              `🆔 Transaction: ${result.data?.transaction_id || 'N/A'}`
+              `🆔 Transaction: ${result.data?.transaction_id || result.data?.OrderTrackingId || 'N/A'}`
             );
           } else {
             bot.sendMessage(chatId, 
@@ -494,7 +477,6 @@ ${invalidRows.length > 0 ? '\n*Invalid Rows:*\n' + invalidRows.map(r => `• ${J
       return;
     }
 
-    // Unknown command
     bot.sendMessage(chatId, "❌ Unknown command. Type /help for available commands.");
 
   } catch (err) {
@@ -506,26 +488,18 @@ ${invalidRows.length > 0 ? '\n*Invalid Rows:*\n' + invalidRows.map(r => `• ${J
 // ---- PESAPAL CALLBACK ----
 app.post("/callback", (req, res) => {
   try {
-    const {
-      pesapal_transaction_tracking_id,
-      pesapal_merchant_reference,
-      status,
-      payment_status_description,
-      amount,
-      currency,
-      payment_method
-    } = req.body;
-
     logger.info("Pesapal callback received:", req.body);
 
-    // Verify signature (implement based on Pesapal documentation)
-    // const isValid = verifyPesapalSignature(req.body);
-    // if (!isValid) {
-    //   logger.warn("Invalid signature in callback");
-    //   return res.status(400).send('Invalid signature');
-    // }
+    const {
+      OrderTrackingId,
+      OrderMerchantReference,
+      OrderStatus,
+      Amount,
+      Currency,
+      PaymentMethod
+    } = req.body;
 
-    const donationStatus = status === 'COMPLETED' || status === 'SUCCESS' ? 'COMPLETED' : 'FAILED';
+    const donationStatus = OrderStatus === 'COMPLETED' ? 'COMPLETED' : 'FAILED';
 
     db.run(
       `UPDATE donations 
@@ -534,20 +508,18 @@ app.post("/callback", (req, res) => {
            pesapal_reference = ?,
            updated_at = CURRENT_TIMESTAMP 
        WHERE id = ?`,
-      [donationStatus, pesapal_transaction_tracking_id, pesapal_merchant_reference, pesapal_merchant_reference],
+      [donationStatus, OrderTrackingId, OrderMerchantReference, OrderMerchantReference],
       (err) => {
         if (err) {
           logger.error("Failed to update donation status from callback:", err);
           return res.status(500).send('Database error');
         }
 
-        // Notify owner
         const message = donationStatus === 'COMPLETED' 
-          ? `✅ Payment completed for donation ${pesapal_merchant_reference}\n` +
-            `💰 Amount: ${currency} ${amount}\n` +
-            `🆔 Transaction: ${pesapal_transaction_tracking_id}`
-          : `❌ Payment failed for donation ${pesapal_merchant_reference}\n` +
-            `Reason: ${payment_status_description || 'Unknown'}`;
+          ? `✅ Payment completed for donation ${OrderMerchantReference}\n` +
+            `💰 Amount: ${Currency} ${Amount}\n` +
+            `🆔 Transaction: ${OrderTrackingId}`
+          : `❌ Payment failed for donation ${OrderMerchantReference}`;
 
         bot.sendMessage(OWNER_ID, message).catch(e => 
           logger.error("Failed to send notification:", e)
@@ -572,7 +544,6 @@ async function checkHealth() {
     memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB`
   };
   
-  // Check database
   try {
     await new Promise((resolve, reject) => {
       db.get("SELECT 1", (err) => {
@@ -585,7 +556,6 @@ async function checkHealth() {
     logger.error("Database health check failed:", err);
   }
   
-  // Check Pesapal
   try {
     const token = await getPesapalToken();
     healthcheck.pesapal = !!token;
@@ -644,6 +614,6 @@ process.on('SIGINT', () => {
 // ---- START SERVER ----
 app.listen(PORT, () => {
   logger.info(`🚀 Server running on port ${PORT}`);
-  logger.info(`🤖 Telegram bot webhook set to: ${TELEGRAM_WEBHOOK_URL}/bot${TELEGRAM_BOT_TOKEN}`);
+  logger.info(`🤖 Telegram bot webhook set to: ${webhookUrl}`);
   logger.info(`💰 Pesapal environment: ${PESAPAL_ENV}`);
 });
