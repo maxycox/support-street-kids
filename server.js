@@ -1,13 +1,15 @@
-// server.js
 require("dotenv").config();
 const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const fs = require("fs");
-const csv = require("csv-parser");
+const csvParser = require("csv-parser");
 
-// --- DATABASE ---
+const app = express();
+app.use(express.json());
+
+// ====== DATABASE SETUP ======
 const db = new sqlite3.Database("./donations.db");
 db.serialize(() => {
   db.run(`
@@ -21,211 +23,155 @@ db.serialize(() => {
   `);
 });
 
-// --- EXPRESS ---
-const app = express();
-app.use(express.json());
-
-// --- TELEGRAM BOT ---
+// ====== TELEGRAM BOT SETUP ======
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const OWNER_ID = process.env.OWNER_ID || "8257970991";
+const OWNER_ID = process.env.ADMIN_CHAT_ID;
 
-// --- PESAPAL HELPER FUNCTIONS ---
-async function getPesapalAccessToken() {
-  const key = process.env.PESAPAL_CONSUMER_KEY;
-  const secret = process.env.PESAPAL_CONSUMER_SECRET;
+// ====== PESAPAL VARIABLES ======
+let pesapalToken = null;
+let ipnId = null;
 
-  const token = Buffer.from(`${key}:${secret}`).toString("base64");
-
-  const response = await axios.post(
-    "https://sandbox.pesapal.com/api/v3/oauth/token", // change to live for production
-    "grant_type=client_credentials",
-    {
-      headers: {
-        Authorization: `Basic ${token}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-    }
-  );
-
-  return response.data.access_token;
+// ====== FETCH PESAPAL TOKEN ======
+async function getPesapalToken() {
+  try {
+    const response = await axios.post("https://pay.pesapal.com/v3/api/Auth/RequestToken", {
+      consumer_key: process.env.PESAPAL_CONSUMER_KEY,
+      consumer_secret: process.env.PESAPAL_CONSUMER_SECRET
+    });
+    pesapalToken = response.data.token;
+    console.log("Pesapal token acquired");
+    return pesapalToken;
+  } catch (err) {
+    console.error("Error fetching Pesapal token:", err.message);
+  }
 }
 
-async function sendPesapalSTK({ accessToken, amount, phone, reference }) {
-  const callbackUrl = process.env.PESAPAL_CALLBACK_URL;
+// ====== FETCH IPN ID ======
+async function getIpnId() {
+  if (!pesapalToken) await getPesapalToken();
 
-  const data = {
+  try {
+    const response = await axios.get("https://pay.pesapal.com/v3/api/URLSetup/GetIpnList", {
+      headers: { Authorization: `Bearer ${pesapalToken}`, Accept: "application/json" }
+    });
+    const ipns = response.data;
+    if (ipns.length > 0) {
+      ipnId = ipns[0].ipn_id;
+      console.log("IPN ID detected:", ipnId);
+    }
+    return ipnId;
+  } catch (err) {
+    console.error("Error fetching IPN ID:", err.message);
+  }
+}
+
+// ====== INITIALIZE PESAPAL ======
+async function initPesapal() {
+  await getPesapalToken();
+  await getIpnId();
+}
+initPesapal();
+
+// ====== STK PUSH FUNCTION ======
+async function sendSTKPush(phone, amount = 100) {
+  if (!pesapalToken || !ipnId) {
+    console.log("Pesapal not initialized");
+    return;
+  }
+
+  const checkoutRequest = {
+    payment_type: "MERCHANT",
     amount: amount,
     currency: "KES",
-    description: "Support Street Kids",
-    type: "MERCHANT",
-    reference: reference,
-    phone_number: phone,
-    callback_url: callbackUrl,
+    description: "Support Street Kids Donation",
+    callback_url: process.env.CALLBACK_URL,
+    notification_id: ipnId,
+    payer: { phone_number: phone }
   };
 
-  const response = await axios.post(
-    "https://sandbox.pesapal.com/api/v3/transactions/initialize", // live for production
-    data,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-
-  return response.data;
+  try {
+    const response = await axios.post(
+      "https://pay.pesapal.com/v3/api/Transactions/RequestPayment",
+      checkoutRequest,
+      { headers: { Authorization: `Bearer ${pesapalToken}`, "Content-Type": "application/json" } }
+    );
+    console.log("STK request sent:", phone);
+  } catch (err) {
+    console.error("Error sending STK:", err.message);
+  }
 }
 
-// --- TELEGRAM BOT HANDLER ---
+// ====== TELEGRAM MESSAGE HANDLER ======
 bot.on("message", async (msg) => {
   if (msg.from.id.toString() !== OWNER_ID) return;
-
   const text = msg.text;
 
-  // Single phone donation
-  if (text && text.startsWith("254") && text.length === 12) {
-    const donationId = "DON_" + Date.now();
+  // ====== BULK STK COMMAND ======
+  if (text === "/bulk") {
+    if (!fs.existsSync("donors.csv")) {
+      bot.sendMessage(msg.chat.id, "donors.csv not found");
+      return;
+    }
 
+    fs.createReadStream("donors.csv")
+      .pipe(csvParser())
+      .on("data", async (row) => {
+        const phone = row.phone;
+        if (phone && phone.startsWith("254") && phone.length === 12) {
+          const donationId = "DONATION_" + Date.now() + Math.floor(Math.random() * 1000);
+
+          db.run(
+            `INSERT INTO donations (id, phone, amount, status) VALUES (?, ?, ?, ?)`,
+            [donationId, phone, 100, "PENDING"]
+          );
+
+          await sendSTKPush(phone, 100);
+          await new Promise((r) => setTimeout(r, 8000)); // 1 push every 8 sec
+        }
+      })
+      .on("end", () => {
+        bot.sendMessage(msg.chat.id, "Bulk STK initiated ✅");
+      });
+    return;
+  }
+
+  // ====== SINGLE DONATION ======
+  if (text && text.startsWith("254") && text.length === 12) {
+    const donationId = "DONATION_" + Date.now();
     db.run(
-      `INSERT INTO donations (id, phone, amount, status)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO donations (id, phone, amount, status) VALUES (?, ?, ?, ?)`,
       [donationId, text, 100, "PENDING"],
-      async function(err) {
+      async function (err) {
         if (err) {
           bot.sendMessage(msg.chat.id, "Database error ❌");
           console.error(err);
         } else {
           bot.sendMessage(msg.chat.id, "Donation logged as PENDING ✅");
-
-          // --- Send STK push ---
-          try {
-            const accessToken = await getPesapalAccessToken();
-            const stkResponse = await sendPesapalSTK({
-              accessToken,
-              amount: 100,
-              phone: text,
-              reference: donationId,
-            });
-
-            console.log("Pesapal STK Response:", stkResponse);
-            bot.sendMessage(msg.chat.id, `STK prompt sent to ${text} ✅`);
-          } catch (err) {
-            console.error("Pesapal STK Error:", err.response?.data || err.message);
-            bot.sendMessage(msg.chat.id, "Error sending STK. Check server logs ❌");
-          }
+          await sendSTKPush(text, 100);
         }
       }
     );
-
-  } else if (text === "/bulk") {
-    bot.sendMessage(msg.chat.id, "Starting bulk STK...");
-    sendBulkSTK(msg.chat.id);
   } else {
     bot.sendMessage(msg.chat.id, "Send phone in format: 2547XXXXXXXX");
   }
 });
 
-// --- BULK STK FUNCTION ---
-function sendBulkSTK(chatId) {
-  const numbers = [];
-  fs.createReadStream("donors.csv")
-    .pipe(csv())
-    .on("data", (row) => {
-      numbers.push(row.phone);
-    })
-    .on("end", async () => {
-      bot.sendMessage(chatId, `Loaded ${numbers.length} donors`);
-
-      let index = 0;
-      const interval = setInterval(async () => {
-        if (index >= numbers.length) {
-          clearInterval(interval);
-          bot.sendMessage(chatId, "Bulk STK completed ✅");
-          return;
-        }
-
-        const phone = numbers[index];
-        const donationId = "DON_" + Date.now();
-
-        db.run(
-          `INSERT INTO donations (id, phone, amount, status)
-          VALUES (?, ?, ?, ?)`,
-          [donationId, phone, 100, "PENDING"]
-        );
-
-        console.log("Sending STK to:", phone);
-
-        try {
-          const accessToken = await getPesapalAccessToken();
-          await sendPesapalSTK({
-            accessToken,
-            amount: 100,
-            phone,
-            reference: donationId,
-          });
-        } catch (err) {
-          console.error("Pesapal bulk error:", err.response?.data || err.message);
-        }
-
-        index++;
-      }, 8000); // 1 push every 8 seconds
-    });
-}
-
-// --- DONATION LINK ROUTE ---
-app.get("/pay/:phone", async (req, res) => {
-  const phone = req.params.phone;
-
-  if (!phone.startsWith("254") || phone.length !== 12) {
-    return res.send("Invalid phone number format");
-  }
-
-  const donationId = "DON_" + Date.now();
-
-  db.run(
-    `INSERT INTO donations (id, phone, amount, status)
-     VALUES (?, ?, ?, ?)`,
-    [donationId, phone, 100, "PENDING"]
-  );
-
-  try {
-    const accessToken = await getPesapalAccessToken();
-    const stkResponse = await sendPesapalSTK({
-      accessToken,
-      amount: 100,
-      phone,
-      reference: donationId,
-    });
-
-    console.log("Pesapal STK Response:", stkResponse);
-
-    res.send(`STK prompt sent to ${phone}`);
-  } catch (err) {
-    console.error("Pesapal STK Error:", err.response?.data || err.message);
-    res.send("Error sending STK. Check server logs.");
-  }
-});
-
-// --- CALLBACK ROUTE ---
+// ====== CALLBACK ROUTE ======
 app.post("/callback", (req, res) => {
-  const { reference, status } = req.body;
-
-  db.run(
-    `UPDATE donations SET status = ? WHERE id = ?`,
-    [status, reference]
-  );
-
+  console.log("Pesapal callback received:", req.body);
+  // Example: update donation status based on Pesapal response
+  const { reference, status } = req.body || {};
+  if (reference && status) {
+    db.run(`UPDATE donations SET status = ? WHERE id = ?`, [status, reference], (err) => {
+      if (err) console.error(err);
+    });
+  }
   res.sendStatus(200);
 });
 
-// --- BASIC TEST ROUTE ---
-app.get("/", (req, res) => {
-  res.send("Support Street Kids Bot Running");
-});
+// ====== TEST ROUTE ======
+app.get("/", (req, res) => res.send("Support Street Kids Bot Running"));
 
-// --- SERVER ---
+// ====== START SERVER ======
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
