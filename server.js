@@ -32,6 +32,7 @@ const PESAPAL_CONSUMER_KEY = process.env.PESAPAL_CONSUMER_KEY;
 const PESAPAL_CONSUMER_SECRET = process.env.PESAPAL_CONSUMER_SECRET;
 const PESAPAL_ENV = process.env.PESAPAL_ENV || "live";
 const PESAPAL_BASE_URL = process.env.PESAPAL_API_BASE || "https://www.pesapal.com/API";
+const PESAPAL_DEMO_URL = "https://demo.pesapal.com/API";
 const MAX_AMOUNT = 150000;
 const BATCH_SIZE = 5;
 
@@ -115,9 +116,13 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // ---- PESAPAL FUNCTIONS ----
 async function getPesapalToken() {
   try {
-    const url = `${PESAPAL_BASE_URL}/Auth/RequestToken`;
+    // Use demo URL if in demo mode, otherwise use live
+    const baseUrl = PESAPAL_ENV === 'demo' ? PESAPAL_DEMO_URL : PESAPAL_BASE_URL;
+    const url = `${baseUrl}/Auth/RequestToken`;
     
-    // Using axios instead of fetch
+    logger.info(`Requesting token from: ${url}`);
+    
+    // Pesapal expects OAuth 1.0 style authentication or Basic Auth
     const response = await http.post(url, {
       consumer_key: PESAPAL_CONSUMER_KEY,
       consumer_secret: PESAPAL_CONSUMER_SECRET
@@ -128,10 +133,44 @@ async function getPesapalToken() {
       }
     });
 
-    logger.info("Successfully obtained Pesapal token");
-    return response.data.token || response.data.access_token;
+    logger.info("Pesapal token response received");
+    
+    // Try different possible response formats
+    if (response.data) {
+      // Check common token field names
+      if (response.data.token) {
+        logger.info("Token found in 'token' field");
+        return response.data.token;
+      } else if (response.data.access_token) {
+        logger.info("Token found in 'access_token' field");
+        return response.data.access_token;
+      } else if (response.data.Token) {
+        logger.info("Token found in 'Token' field");
+        return response.data.Token;
+      } else if (response.data.AccessToken) {
+        logger.info("Token found in 'AccessToken' field");
+        return response.data.AccessToken;
+      } else if (response.data.status === 'success' && response.data.token) {
+        logger.info("Token found in success response");
+        return response.data.token;
+      } else {
+        // If it's a string response, maybe it's directly the token
+        if (typeof response.data === 'string' && response.data.length > 10) {
+          logger.info("Response is string, using as token");
+          return response.data;
+        }
+        // Log the full response for debugging
+        logger.error("Unexpected token response format:", JSON.stringify(response.data));
+      }
+    }
+    
+    return null;
   } catch (err) {
     logger.error("Failed to get Pesapal token:", err.response?.data || err.message);
+    if (err.response) {
+      logger.error("Error response status:", err.response.status);
+      logger.error("Error response data:", err.response.data);
+    }
     return null;
   }
 }
@@ -139,51 +178,107 @@ async function getPesapalToken() {
 async function sendSTK(phone, amount, donationId, retryCount = 0) {
   try {
     const token = await getPesapalToken();
-    if (!token) throw new Error("No Pesapal token available");
+    if (!token) {
+      logger.error(`No token available for ${donationId}`);
+      throw new Error("Could not obtain Pesapal token");
+    }
 
-    // Format phone number (remove any non-numeric characters)
+    logger.info(`Token obtained for ${donationId}: ${token.substring(0, 15)}...`);
+
     const cleanPhone = phone.replace(/\D/g, '');
+    
+    // Use appropriate base URL
+    const baseUrl = PESAPAL_ENV === 'demo' ? PESAPAL_DEMO_URL : PESAPAL_BASE_URL;
+    
+    // Different endpoints to try based on Pesapal API version
+    const endpoints = [
+      `${baseUrl}/SubmitOrderDirect`,
+      `${baseUrl}/API/STKPush`,
+      `${baseUrl}/Transaction/STKPush`,
+      `${baseUrl}/v3/STKPush`
+    ];
     
     const payload = {
       amount: amount,
       phone: cleanPhone,
+      phone_number: cleanPhone,
       reference: donationId,
+      merchant_reference: donationId,
       description: "Support Street Kids Donation",
       callback_url: process.env.PESAPAL_CALLBACK_URL || `${TELEGRAM_WEBHOOK_URL}/callback`,
+      callback: process.env.PESAPAL_CALLBACK_URL || `${TELEGRAM_WEBHOOK_URL}/callback`,
       currency: "KES"
     };
 
     logger.info(`Sending STK push for donation ${donationId}`);
 
-    const response = await http.post(
-      `${PESAPAL_BASE_URL}/SubmitOrderDirect`,
-      payload,
-      { 
-        headers: { 
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
-
-    logger.info(`STK push successful for ${donationId}`);
+    let lastError = null;
     
-    if (response.data.transaction_id || response.data.OrderTrackingId) {
-      const transactionId = response.data.transaction_id || response.data.OrderTrackingId;
-      await new Promise((resolve, reject) => {
-        db.run(
-          `UPDATE donations SET pesapal_transaction_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          [transactionId, donationId],
-          (err) => err ? reject(err) : resolve()
+    // Try each endpoint until one works
+    for (const endpoint of endpoints) {
+      try {
+        logger.info(`Trying endpoint: ${endpoint}`);
+        
+        const response = await http.post(
+          endpoint,
+          payload,
+          { 
+            headers: { 
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            timeout: 30000
+          }
         );
-      });
+
+        logger.info(`STK push response from ${endpoint}:`, response.data);
+        
+        // Check if response indicates success
+        if (response.data) {
+          // Try to find transaction ID in various possible fields
+          const transactionId = response.data.transaction_id || 
+                               response.data.TransactionId ||
+                               response.data.OrderTrackingId || 
+                               response.data.tracking_id ||
+                               response.data.reference ||
+                               response.data.Reference;
+          
+          if (transactionId) {
+            await new Promise((resolve, reject) => {
+              db.run(
+                `UPDATE donations SET pesapal_transaction_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [transactionId, "PROCESSING", donationId],
+                (err) => err ? reject(err) : resolve()
+              );
+            });
+            
+            return { success: true, data: response.data, transactionId };
+          } else if (response.data.status === 'success' || response.data.success === true) {
+            // Success but no transaction ID
+            return { success: true, data: response.data };
+          }
+        }
+      } catch (endpointErr) {
+        logger.warn(`Endpoint ${endpoint} failed:`, endpointErr.message);
+        lastError = endpointErr;
+        continue;
+      }
     }
     
-    return { success: true, data: response.data };
-  } catch (err) {
-    logger.error(`STK push failed for ${donationId} (attempt ${retryCount + 1}):`, err.response?.data || err.message);
+    // If all endpoints failed
+    throw lastError || new Error("All STK endpoints failed");
     
+  } catch (err) {
+    logger.error(`STK push failed for ${donationId} (attempt ${retryCount + 1}):`, 
+      err.response?.data || err.message);
+    
+    if (err.response) {
+      logger.error("Error status:", err.response.status);
+      logger.error("Error data:", err.response.data);
+    }
+    
+    // Update database with error
     await new Promise((resolve) => {
       db.run(
         `UPDATE donations SET error_message = ?, retry_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -239,6 +334,7 @@ bot.on("message", async (msg) => {
 • /stats - View donation statistics
 • /retry [donation_id] - Retry failed donation
 • /health - Check system status
+• /test-pesapal - Test Pesapal connection
 
 *Examples:*
 \`/bulk 5\` - Process 5 donations at a time
@@ -255,6 +351,7 @@ bot.on("message", async (msg) => {
           COUNT(*) as total,
           SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
           SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending,
+          SUM(CASE WHEN status = 'PROCESSING' THEN 1 ELSE 0 END) as processing,
           SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
           SUM(CASE WHEN status = 'COMPLETED' THEN amount ELSE 0 END) as total_amount
         FROM donations
@@ -268,6 +365,7 @@ bot.on("message", async (msg) => {
 📊 *Donation Statistics*
 Total: ${row.total || 0}
 ✅ Completed: ${row.completed || 0}
+⏳ Processing: ${row.processing || 0}
 ⏳ Pending: ${row.pending || 0}
 ❌ Failed: ${row.failed || 0}
 💰 Total Amount: KES ${row.total_amount || 0}
@@ -285,10 +383,39 @@ Total: ${row.total || 0}
         `${status} *System Health*\n` +
         `• Database: ${health.database ? '✅' : '❌'}\n` +
         `• Pesapal: ${health.pesapal ? '✅' : '❌'}\n` +
+        `• Environment: ${PESAPAL_ENV}\n` +
         `• Uptime: ${Math.floor(health.uptime / 60)} minutes\n` +
         `• Memory: ${health.memory}`,
         { parse_mode: 'Markdown' }
       );
+      return;
+    }
+
+    if (text === "/test-pesapal") {
+      bot.sendMessage(chatId, "🔄 Testing Pesapal connection...");
+      
+      try {
+        const token = await getPesapalToken();
+        
+        if (token) {
+          bot.sendMessage(chatId, 
+            `✅ *Pesapal Connection Successful*\n\n` +
+            `Token: ${token.substring(0, 20)}...\n` +
+            `Environment: ${PESAPAL_ENV}\n` +
+            `API URL: ${PESAPAL_ENV === 'demo' ? PESAPAL_DEMO_URL : PESAPAL_BASE_URL}`,
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          bot.sendMessage(chatId, 
+            `❌ *Pesapal Connection Failed*\n\n` +
+            `Could not obtain token. Check your credentials and environment.\n` +
+            `Environment: ${PESAPAL_ENV}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } catch (err) {
+        bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+      }
       return;
     }
 
@@ -314,7 +441,10 @@ Total: ${row.total || 0}
         const result = await sendSTKWithRetry(row.phone, row.amount, donationId);
         
         if (result.success) {
-          bot.sendMessage(chatId, `✅ STK push resent successfully for ${donationId}`);
+          bot.sendMessage(chatId, 
+            `✅ STK push resent successfully for ${donationId}\n` +
+            `Transaction ID: ${result.transactionId || 'N/A'}`
+          );
         } else {
           bot.sendMessage(chatId, `❌ Failed to resend STK: ${result.error}`);
         }
@@ -463,7 +593,7 @@ ${invalidRows.length > 0 ? '\n*Invalid Rows:*\n' + invalidRows.map(r => `• ${J
               `✅ STK push sent successfully!\n` +
               `📱 Phone: ${text}\n` +
               `💰 Amount: KES ${amount}\n` +
-              `🆔 Transaction: ${result.data?.transaction_id || result.data?.OrderTrackingId || 'N/A'}`
+              `🆔 Transaction: ${result.transactionId || result.data?.OrderTrackingId || 'N/A'}`
             );
           } else {
             bot.sendMessage(chatId, 
@@ -494,12 +624,16 @@ app.post("/callback", (req, res) => {
       OrderTrackingId,
       OrderMerchantReference,
       OrderStatus,
+      Status,
       Amount,
       Currency,
       PaymentMethod
     } = req.body;
 
-    const donationStatus = OrderStatus === 'COMPLETED' ? 'COMPLETED' : 'FAILED';
+    // Determine status from various possible fields
+    const paymentStatus = OrderStatus || Status;
+    const donationStatus = paymentStatus === 'COMPLETED' || paymentStatus === 'SUCCESS' ? 'COMPLETED' : 'FAILED';
+    const transactionId = OrderTrackingId || req.body.transaction_id;
 
     db.run(
       `UPDATE donations 
@@ -508,7 +642,7 @@ app.post("/callback", (req, res) => {
            pesapal_reference = ?,
            updated_at = CURRENT_TIMESTAMP 
        WHERE id = ?`,
-      [donationStatus, OrderTrackingId, OrderMerchantReference, OrderMerchantReference],
+      [donationStatus, transactionId, OrderMerchantReference, OrderMerchantReference],
       (err) => {
         if (err) {
           logger.error("Failed to update donation status from callback:", err);
@@ -517,8 +651,8 @@ app.post("/callback", (req, res) => {
 
         const message = donationStatus === 'COMPLETED' 
           ? `✅ Payment completed for donation ${OrderMerchantReference}\n` +
-            `💰 Amount: ${Currency} ${Amount}\n` +
-            `🆔 Transaction: ${OrderTrackingId}`
+            `💰 Amount: ${Currency || 'KES'} ${Amount || 'N/A'}\n` +
+            `🆔 Transaction: ${transactionId || 'N/A'}`
           : `❌ Payment failed for donation ${OrderMerchantReference}`;
 
         bot.sendMessage(OWNER_ID, message).catch(e => 
@@ -566,10 +700,51 @@ async function checkHealth() {
   return healthcheck;
 }
 
-// ---- HEALTH CHECK ENDPOINT ----
+// ---- HEALTH CHECK ENDPOINTS ----
 app.get("/health", async (req, res) => {
   const health = await checkHealth();
   res.json(health);
+});
+
+app.get("/healthz", (req, res) => {
+  res.status(200).send("OK");
+});
+
+// ---- TEST PESAPAL ENDPOINT ----
+app.get("/test-pesapal", async (req, res) => {
+  try {
+    const token = await getPesapalToken();
+    
+    res.json({
+      success: !!token,
+      token: token ? `${token.substring(0, 20)}...` : null,
+      environment: PESAPAL_ENV,
+      base_url: PESAPAL_ENV === 'demo' ? PESAPAL_DEMO_URL : PESAPAL_BASE_URL,
+      has_consumer_key: !!PESAPAL_CONSUMER_KEY,
+      has_consumer_secret: !!PESAPAL_CONSUMER_SECRET,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+      stack: err.stack
+    });
+  }
+});
+
+// ---- DEBUG ENDPOINT ----
+app.get("/debug", (req, res) => {
+  res.json({
+    port: process.env.PORT,
+    node_env: process.env.NODE_ENV,
+    server_port: PORT,
+    webhook: webhookUrl,
+    pesapal_env: PESAPAL_ENV,
+    pesapal_base_url: PESAPAL_BASE_URL,
+    pesapal_demo_url: PESAPAL_DEMO_URL,
+    owner_id: OWNER_ID
+  });
 });
 
 // ---- WEBHOOK ENDPOINT ----
@@ -584,6 +759,7 @@ app.get("/", (req, res) => {
     name: "Support Street Kids Donation Bot",
     version: "1.0.0",
     status: "running",
+    environment: PESAPAL_ENV,
     timestamp: new Date().toISOString()
   });
 });
@@ -594,26 +770,37 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
+// ---- START SERVER ----
+const server = app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`✅ Server bound to 0.0.0.0 on port ${PORT}`);
+  logger.info(`🤖 Telegram bot webhook set to: ${webhookUrl}`);
+  logger.info(`💰 Pesapal environment: ${PESAPAL_ENV}`);
+  logger.info(`📊 Health check available at: /healthz`);
+  logger.info(`🔧 Test Pesapal at: /test-pesapal`);
+});
+
+server.on('error', (error) => {
+  logger.error("Server failed to start:", error.message);
+  process.exit(1);
+});
+
 // ---- GRACEFUL SHUTDOWN ----
 process.on('SIGTERM', () => {
   logger.info('SIGTERM received. Shutting down gracefully...');
-  db.close(() => {
-    logger.info('Database connection closed');
-    process.exit(0);
+  server.close(() => {
+    db.close(() => {
+      logger.info('Database connection closed');
+      process.exit(0);
+    });
   });
 });
 
 process.on('SIGINT', () => {
   logger.info('SIGINT received. Shutting down gracefully...');
-  db.close(() => {
-    logger.info('Database connection closed');
-    process.exit(0);
+  server.close(() => {
+    db.close(() => {
+      logger.info('Database connection closed');
+      process.exit(0);
+    });
   });
-});
-
-// ---- START SERVER ----
-app.listen(PORT, () => {
-  logger.info(`🚀 Server running on port ${PORT}`);
-  logger.info(`🤖 Telegram bot webhook set to: ${webhookUrl}`);
-  logger.info(`💰 Pesapal environment: ${PESAPAL_ENV}`);
 });
